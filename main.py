@@ -5,6 +5,9 @@ from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from queue import Queue
 
+import matplotlib.pyplot as plt
+from matplotlib.ticker import PercentFormatter
+
 
 ASSEMBLY_WORKERS = 5
 TESTING_WORKERS = 3
@@ -25,6 +28,7 @@ class Circuit:
     _mark_lock: threading.Lock = field(
         default_factory=threading.Lock, repr=False, compare=False
     )
+    assembler: str = "Unknown"
 
     def mark_inspected(self, inspector: str) -> None:
         with self._mark_lock:
@@ -66,6 +70,15 @@ class Factory:
         self._metrics_lock = threading.Lock()
         self._good_circuits_count = 0
         self._bad_circuits_count = 0
+        self._bad_circuits: list[tuple[int, str]] = []
+        self._assembled_by_worker = {
+            f"Assembler-{worker_number}": 0
+            for worker_number in range(1, ASSEMBLY_WORKERS + 1)
+        }
+        self._failed_by_worker = {
+            f"Assembler-{worker_number}": 0
+            for worker_number in range(1, ASSEMBLY_WORKERS + 1)
+        }
         self._production_time_total = 0.0
         self._production_time_count = 0
         self._testing_time_total = 0.0
@@ -91,6 +104,7 @@ class Factory:
         self._assembly_threads = [
             threading.Thread(
                 target=self._assembly_worker,
+                args=(worker_number,),
                 name=f"Assembler-{worker_number}",
             )
             for worker_number in range(1, ASSEMBLY_WORKERS + 1)
@@ -189,6 +203,7 @@ class Factory:
         with self._metrics_lock:
             good_circuits = self._good_circuits_count
             bad_circuits = self._bad_circuits_count
+            bad_circuits_detail = tuple(self._bad_circuits)
             production_time_total = self._production_time_total
             production_time_count = self._production_time_count
             testing_time_total = self._testing_time_total
@@ -199,6 +214,40 @@ class Factory:
         print("Production report")
         print(f"Total good circuits: {good_circuits}")
         print(f"Total bad circuits: {bad_circuits}")
+        print("Failed circuits by assembly worker:")
+        assemblers = [
+            f"Assembler-{worker_number}"
+            for worker_number in range(1, ASSEMBLY_WORKERS + 1)
+        ]
+        circuits_by_assembler = {
+            assembler: [] for assembler in assemblers
+        }
+        for circuit_id, assembler in bad_circuits_detail:
+            circuits_by_assembler[assembler].append(f"Circuit {circuit_id}")
+
+        columns = [circuits_by_assembler[assembler] for assembler in assemblers]
+        widths = [
+            max([len(assembler), *(len(circuit) for circuit in circuits)])
+            for assembler, circuits in zip(assemblers, columns)
+        ]
+        print(
+            " | ".join(
+                assembler.ljust(width)
+                for assembler, width in zip(assemblers, widths)
+            )
+        )
+        print("-+-".join("-" * width for width in widths))
+        if bad_circuits_detail:
+            for row in range(max(map(len, columns), default=0)):
+                print(
+                    " | ".join(
+                        (circuits[row] if row < len(circuits) else "").ljust(width)
+                        for circuits, width in zip(columns, widths)
+                    )
+                )
+        else:
+            print(" | ".join("None".ljust(width) for width in widths))
+
         if (
             production_time_count
             and testing_time_count
@@ -218,6 +267,47 @@ class Factory:
                 "Average combined time (produce, test, and package): "
                 "N/A (no completed circuits)"
             )
+
+    def graph(self) -> None:
+        with self._metrics_lock:
+            worker_results = tuple(
+                (
+                    worker,
+                    self._failed_by_worker[worker],
+                    self._assembled_by_worker[worker],
+                )
+                for worker in self._assembled_by_worker
+            )
+
+        failure_rates = [
+            failed / assembled if assembled else 0.0
+            for _, failed, assembled in worker_results
+        ]
+        workers = [worker for worker, _, _ in worker_results]
+
+        figure, axis = plt.subplots()
+        bars = axis.bar(workers, failure_rates)
+        axis.set_title("Failure Rate per Assembly Worker")
+        axis.set_xlabel("Assembly Worker")
+        axis.set_ylabel("Failure Rate")
+        axis.yaxis.set_major_formatter(PercentFormatter(1.0))
+        axis.set_ylim(0, max(failure_rates, default=0.0) * 1.2 or 0.01)
+
+        label_offset = axis.get_ylim()[1] * 0.02
+        for bar, (_, failed, assembled), rate in zip(
+            bars, worker_results, failure_rates
+        ):
+            label = f"{rate:.2%}\n({failed}/{assembled})" if assembled else "N/A"
+            axis.text(
+                bar.get_x() + bar.get_width() / 2,
+                bar.get_height() + label_offset,
+                label,
+                ha="center",
+                va="bottom",
+            )
+
+        figure.tight_layout()
+        plt.show()
 
     def spotcheck(
         self, inspector: str, box_number: int, circuit_id: int
@@ -253,7 +343,7 @@ class Factory:
                 f"{marked_inspector or 'no inspector mark'}."
             )
 
-    def _assembly_worker(self) -> None:
+    def _assembly_worker(self, worker_number: int) -> None:
         while not self._stop_event.is_set():
             started_at = time.perf_counter()
             assembly_time = max(0.01, random.gauss(11, 2))
@@ -262,13 +352,17 @@ class Factory:
             elapsed = time.perf_counter() - started_at
 
             with self._assembly_condition:
-                circuit = Circuit(self._next_circuit_id)
+                circuit = Circuit(
+                    self._next_circuit_id,
+                    assembler=f"Assembler-{worker_number}",
+                )
                 self._next_circuit_id += 1
                 self._assembled.append(circuit)
                 self._assembly_condition.notify()
             with self._metrics_lock:
                 self._production_time_total += elapsed
                 self._production_time_count += 1
+                self._assembled_by_worker[f"Assembler-{worker_number}"] += 1
 
     def _overseer(self) -> None:
         while True:
@@ -339,6 +433,10 @@ class Factory:
             with self._metrics_lock:
                 if failed:
                     self._bad_circuits_count += 1
+                    self._bad_circuits.append(
+                        (circuit.circuit_id, circuit.assembler)
+                    )
+                    self._failed_by_worker[circuit.assembler] += 1
                 else:
                     self._good_circuits_count += 1
                     self._good_circuits.put(circuit)
@@ -402,7 +500,7 @@ class Factory:
 def main() -> None:
     factory = Factory()
     print(
-        "Commands: begin, halt, inventory, report, spotcheck, "
+        "Commands: begin, halt, inventory, report, graph, spotcheck, "
         "spotcheck <inspector> <box> <circuit ID>, exit"
     )
 
@@ -429,6 +527,8 @@ def main() -> None:
             factory.inventory_report()
         elif command == "report":
             factory.report()
+        elif command == "graph":
+            factory.graph()
         elif command == "spotcheck":
             if not arguments:
                 inspector = input("Inspector name: ").strip()
@@ -451,7 +551,10 @@ def main() -> None:
                 factory.halt()
             return
         else:
-            print("Unknown command. Enter begin, halt, inventory, spotcheck, or exit.")
+            print(
+                "Unknown command. Enter begin, halt, inventory, report, "
+                "graph, spotcheck, or exit."
+            )
 
 
 if __name__ == "__main__":
