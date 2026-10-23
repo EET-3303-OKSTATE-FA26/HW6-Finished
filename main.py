@@ -457,9 +457,8 @@ class Factory:
             inspector = circuit.get_inspector()
             if inspector is None:
                 self._good_circuits.task_done()
-                raise RuntimeError(
-                    f"Circuit {circuit.circuit_id} has no inspector mark."
-                )
+                print(f"Skipped circuit {circuit.circuit_id}: no inspector mark.")
+                continue
 
             started_at = time.perf_counter()
             inspector_circuits = circuits_by_inspector[inspector]
