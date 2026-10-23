@@ -457,14 +457,15 @@ class Factory:
             inspector = circuit.get_inspector()
             if inspector is None:
                 self._good_circuits.task_done()
-                raise RuntimeError(
-                    f"Circuit {circuit.circuit_id} has no inspector mark."
-                )
+                print(f"Skipped circuit {circuit.circuit_id}: no inspector mark.")
+                continue
 
             started_at = time.perf_counter()
             inspector_circuits = circuits_by_inspector[inspector]
             inspector_circuits.append(circuit)
             if len(inspector_circuits) == BOX_CAPACITY:
+                # Spec: grabbing and boxing 5 circuits takes ~2 s (std dev 0.25 s)
+                self._stop_event.wait(max(0.01, random.gauss(2, 0.25)))
                 boxed_circuits = tuple(inspector_circuits)
                 with self._inventory_lock:
                     box_number = len(self._inventory[inspector]) + 1
